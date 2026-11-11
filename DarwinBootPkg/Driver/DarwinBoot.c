@@ -22,7 +22,12 @@
 #include "LoaderInputs.h"
 
 #define WINDOW_SIZE  SIZE_256MB
-#define BLOCK_SIZE   SIZE_2MB
+// openplus: 32 MiB congruence.  XNU's bootstrap page tables for this board
+// use 16K pages, so one L2 block covers 32 MiB and create_l2_block_entries
+// needs virtBase and physBase congruent modulo that.  Aligning to 2 MiB only
+// left the two 16 MiB apart, and every kernel virtual address then resolved
+// 16 MiB away from the code.  Keep the kernel's own offset inside the block.
+#define BLOCK_SIZE   SIZE_32MB
 // The largest kernel file read: the default window. A macOS kernel collection is about 137 MiB; the window check
 // below still bounds the kernel with everything placed after it.
 #define KERNEL_LIMIT SIZE_256MB
