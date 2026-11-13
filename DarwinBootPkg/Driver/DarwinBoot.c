@@ -1076,6 +1076,18 @@ Boot (
   Print (L"DARWINBOOT: video base=0x%lx display=%lu row=%lu width=%lu height=%lu depth=%lu\n",
          Video[0], Video[1], Video[2], Video[3], Video[4], Video[5]);
   Print (L"DARWINBOOT: command line: %a\n", CommandLine);
+  // Read the structure back out of memory, not out of the locals above: the kernel
+  // resolves every one of these through virtBase/physBase, and a value that is not
+  // here on the panel cannot be argued about later.
+  Print (L"DARWINBOOT: args@0x%lx rev=%u ver=%u va=0x%lx pa=0x%lx dt=0x%lx dtlen=0x%lx vbase=0x%lx\n",
+         ArgsAddress,
+         (UINT32)((DARWIN_BOOT_ARGS *)(UINTN)ArgsAddress)->Revision,
+         (UINT32)((DARWIN_BOOT_ARGS *)(UINTN)ArgsAddress)->Version,
+         ((DARWIN_BOOT_ARGS *)(UINTN)ArgsAddress)->VirtualBase,
+         ((DARWIN_BOOT_ARGS *)(UINTN)ArgsAddress)->PhysicalBase,
+         ((DARWIN_BOOT_ARGS *)(UINTN)ArgsAddress)->DeviceTree,
+         (UINT64)((DARWIN_BOOT_ARGS *)(UINTN)ArgsAddress)->DeviceTreeLength,
+         ((DARWIN_BOOT_ARGS *)(UINTN)ArgsAddress)->Video[0]);
   Print (L"DARWINBOOT: inputs validated; exiting boot services\n");
 
   //
