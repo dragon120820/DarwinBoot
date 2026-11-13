@@ -60,8 +60,9 @@ typedef size_t UINTN; typedef int BOOLEAN;
 enum { EfiReservedMemoryType, EfiLoaderCode, EfiLoaderData, EfiBootServicesCode, EfiBootServicesData,
        EfiRuntimeServicesCode, EfiRuntimeServicesData, EfiConventionalMemory };
 typedef struct { UINT32 Type; UINT64 PhysicalStart; UINT64 VirtualStart; UINT64 NumberOfPages; UINT64 Attribute; } EFI_MEMORY_DESCRIPTOR;
-static UINT64 ReadUnaligned64(const UINT64 *p) { UINT64 v; memcpy(&v, p, 8); return v; }
-static void WriteUnaligned64(UINT64 *p, UINT64 v) { memcpy(p, &v, 8); }
+// Explicit bytes preserve the unaligned API contract under Clang's memcpy instrumentation.
+static UINT64 ReadUnaligned64(const UINT64 *p) { UINT64 v; memcpy(&v, (const unsigned char *)p, 8); return v; }
+static void WriteUnaligned64(UINT64 *p, UINT64 v) { memcpy((unsigned char *)p, &v, 8); }
 #include "MemoryWindow.h"
 size_t outside(const void *map, size_t size, size_t stride, UINT64 base, UINT64 window, UINT8 *table, size_t capacity, UINT64 *bytes) {
   return DarwinOutsideRanges(map, size, stride, base, window, 0x10000, 0x100000, table, capacity, bytes);

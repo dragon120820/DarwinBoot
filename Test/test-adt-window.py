@@ -14,6 +14,7 @@ preamble = '''
 #include <stddef.h>
 #include <string.h>
 #include "WindowSize.h"
+#include "BootArgs.h"
 #define DARWIN_INPUT_COUNT 2
 #define DARWIN_INPUT_RECORD_SIZE 32
 typedef uint8_t UINT8; typedef uint32_t UINT32; typedef uint64_t UINT64;
@@ -32,11 +33,14 @@ static UINT32 U32(const void *p) { UINT32 v; memcpy(&v, p, 4); return v; }
 static UINT64 U64(const void *p) { UINT64 v; memcpy(&v, p, 8); return v; }
 '''
 entry = '''
-int parse(const UINT8 *tree, UINTN size, UINT64 *window, UINTN *excluded, UINTN *capacity, UINTN *inputs) {
+int parse(const UINT8 *tree, UINTN size, UINT64 *window, UINTN *excluded, UINTN *capacity, UINTN *inputs, UINT32 *command_size) {
   UINTN at = 0, ramdisk = MAX_UINTN, trust = MAX_UINTN, addon = MAX_UINTN, policy = MAX_UINTN;
   BOOLEAN packed = FALSE;
   *window = 0; *excluded = MAX_UINTN; *capacity = 0; *inputs = MAX_UINTN;
-  return AdtNode(tree, size, &at, 0, 3, &ramdisk, &trust, &addon, &policy, window, &packed, excluded, capacity, inputs) && at == size;
+  *command_size = 0;
+  if (!AdtNode(tree, size, &at, 0, 3, &ramdisk, &trust, &addon, &policy, window, &packed, excluded, capacity, inputs, command_size) || at != size) return 0;
+  if (*command_size == 0) *command_size = 1024;
+  return 1;
 }
 '''
 
@@ -53,15 +57,17 @@ with tempfile.TemporaryDirectory(prefix='darwinboot-adt-') as temporary:
     work = Path(temporary)
     (work / 'parser.c').write_text(preamble + parser + entry)
     subprocess.run(['clang', '-Wall', '-Wextra', '-Werror', '-fsanitize=undefined', '-fno-sanitize-recover=all', '-shared', '-fPIC',
-                    '-I', str(driver), str(work / 'parser.c'), '-o', str(work / 'parser.dylib')], check=True)
+                    '-I', str(Path(__file__).resolve().parent / 'Host'), '-I', str(driver), str(work / 'parser.c'), '-o', str(work / 'parser.dylib')], check=True)
     lib = ctypes.CDLL(str(work / 'parser.dylib'))
     lib.parse.argtypes = [ctypes.c_char_p, ctypes.c_size_t, ctypes.POINTER(ctypes.c_uint64),
-                          ctypes.POINTER(ctypes.c_size_t), ctypes.POINTER(ctypes.c_size_t), ctypes.POINTER(ctypes.c_size_t)]
+                          ctypes.POINTER(ctypes.c_size_t), ctypes.POINTER(ctypes.c_size_t), ctypes.POINTER(ctypes.c_size_t),
+                          ctypes.POINTER(ctypes.c_uint32)]
 
     def parse_all(tree):
         window, excluded, capacity, inputs = ctypes.c_uint64(), ctypes.c_size_t(), ctypes.c_size_t(), ctypes.c_size_t()
-        ok = lib.parse(tree, len(tree), ctypes.byref(window), ctypes.byref(excluded), ctypes.byref(capacity), ctypes.byref(inputs))
-        return bool(ok), window.value, excluded.value, capacity.value, inputs.value
+        command_size = ctypes.c_uint32()
+        ok = lib.parse(tree, len(tree), ctypes.byref(window), ctypes.byref(excluded), ctypes.byref(capacity), ctypes.byref(inputs), ctypes.byref(command_size))
+        return bool(ok), window.value, excluded.value, capacity.value, inputs.value, command_size.value
 
     def parse(tree):
         return parse_all(tree)[:4]
@@ -102,7 +108,7 @@ with tempfile.TemporaryDirectory(prefix='darwinboot-adt-') as temporary:
     record = ('darwinboot-loader-inputs', bytes(64))
     assert parse_all(chosen(size))[4] == none
     for tree in (chosen(record), chosen(size, table, record), chosen(record, size, table)):
-        ok, _, _, _, offset = parse_all(tree)
+        ok, _, _, _, offset, _ = parse_all(tree)
         assert ok and tree[offset - 36:offset - 36 + 25] == b'darwinboot-loader-inputs\0'
         assert struct.unpack_from('<I', tree, offset - 4)[0] == 64 and offset + 64 <= len(tree)
     assert parse_all(chosen(size, table, record))[:4] == parse(chosen(size, table)), 'the record changes no other result'
@@ -115,5 +121,23 @@ with tempfile.TemporaryDirectory(prefix='darwinboot-adt-') as temporary:
     assert not parse_all(chosen(size, record, record))[0], 'duplicate record'
     assert not parse_all(node('device-tree', [record], [node('chosen', [size])]))[0], 'record in the root node'
     assert not parse_all(node('device-tree', children=[node('chosen', [size], [node('memory-map', [record])])]))[0], 'record in memory-map'
+    selector = lambda value: ('darwinboot-command-line-size', struct.pack('<I', value))
+    assert parse_all(chosen())[-1] == 1024, 'default wire must remain Darwin23'
+    for value in (608, 1024):
+        assert parse_all(chosen(selector(value)))[::5] == (True, value)
+        # Property order must not bypass path validation.
+        assert parse_all(node('device-tree', children=[node('chosen', [selector(value), size])]))[-1] == value
+    for value in (0, 1, 607, 609, 1023, 1025, 0xffffffff):
+        assert not parse_all(chosen(selector(value)))[0], value
+    for length in (0, 1, 2, 3, 5, 8):
+        assert not parse_all(chosen(('darwinboot-command-line-size', bytes(length))))[0], length
+    pick = selector(608)
+    assert not parse_all(chosen(pick, pick))[0], 'duplicate selector'
+    assert not parse_all(chosen(pick, selector(1024)))[0], 'conflicting selector'
+    assert not parse_all(node('device-tree', [pick], [node('chosen')]))[0], 'selector in root'
+    assert not parse_all(node('device-tree', children=[node('chosen', children=[node('memory-map', [pick])])]))[0], 'selector in memory-map'
+    assert not parse_all(node('device-tree', children=[node('not-chosen', [pick])]))[0], 'wrong path'
+    assert not parse_all(node('device-tree', children=[node('chosen', [pick]), node('chosen', [pick])]))[0], 'selector across chosen nodes'
+    print('PASS: default/608/1024 command-line selector and 19 invalid/path/duplicate cases')
     print(f'PASS: window size, excluded-range table and loader input record of /chosen, '
           f'{len(refused) + 4 + len(refused_records) + 3} refusal cases')

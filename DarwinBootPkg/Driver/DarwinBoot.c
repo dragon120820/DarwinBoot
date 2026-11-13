@@ -291,7 +291,7 @@ ParseKernel (CONST UINT8 *Data, UINTN Size, KERNEL *Kernel)
 
 STATIC
 BOOLEAN
-AdtNode (CONST UINT8 *Data, UINTN Size, UINTN *Offset, UINTN Depth, UINTN ParentPath, UINTN *RamdiskOffset, UINTN *TrustCacheOffset, UINTN *AddonOffset, UINTN *PolicyOffset, UINT64 *WindowSize, BOOLEAN *KeepPacked, UINTN *ExcludedOffset, UINTN *ExcludedCapacity, UINTN *InputsOffset)
+AdtNode (CONST UINT8 *Data, UINTN Size, UINTN *Offset, UINTN Depth, UINTN ParentPath, UINTN *RamdiskOffset, UINTN *TrustCacheOffset, UINTN *AddonOffset, UINTN *PolicyOffset, UINT64 *WindowSize, BOOLEAN *KeepPacked, UINTN *ExcludedOffset, UINTN *ExcludedCapacity, UINTN *InputsOffset, UINT32 *CommandLineSize)
 {
   UINT32 Properties;
   UINT32 Children;
@@ -306,6 +306,7 @@ AdtNode (CONST UINT8 *Data, UINTN Size, UINTN *Offset, UINTN Depth, UINTN Parent
   UINTN  ExcludedCandidate;
   UINTN  ExcludedLength;
   UINTN  InputsCandidate;
+  UINTN  CommandLineCandidate;
   CONST UINT8 *Name;
   UINTN  NameLength;
 
@@ -319,6 +320,7 @@ AdtNode (CONST UINT8 *Data, UINTN Size, UINTN *Offset, UINTN Depth, UINTN Parent
   ExcludedCandidate = MAX_UINTN;
   ExcludedLength = 0;
   InputsCandidate = MAX_UINTN;
+  CommandLineCandidate = MAX_UINTN;
   if ((Depth > 64) || (Size - *Offset < 8)) { return FALSE; }
   Properties = U32 (Data + *Offset);
   Children = U32 (Data + *Offset + 4);
@@ -359,6 +361,10 @@ AdtNode (CONST UINT8 *Data, UINTN Size, UINTN *Offset, UINTN Depth, UINTN Parent
     if (AsciiStrCmp ((CONST CHAR8 *)(Data + *Offset - 36), "darwinboot-memory-size") == 0) {
       if ((MemoryCandidate != MAX_UINTN) || (Length != 8)) { return FALSE; }
       MemoryCandidate = *Offset;
+    }
+    if (AsciiStrCmp ((CONST CHAR8 *)(Data + *Offset - 36), "darwinboot-command-line-size") == 0) {
+      if ((CommandLineCandidate != MAX_UINTN) || (Length != 4)) { return FALSE; }
+      CommandLineCandidate = *Offset;
     }
     // The table the loader fills with the ranges of the window XNU must not use (MemoryWindow.h): empty pairs.
     if (AsciiStrCmp ((CONST CHAR8 *)(Data + *Offset - 36), "darwinboot-memory-excluded") == 0) {
@@ -402,6 +408,12 @@ AdtNode (CONST UINT8 *Data, UINTN Size, UINTN *Offset, UINTN Depth, UINTN Parent
     *WindowSize = U64 (Data + MemoryCandidate);
     if (!DarwinWindowSizeValid (*WindowSize)) { return FALSE; }
   }
+  if (CommandLineCandidate != MAX_UINTN) {
+    // A zero selector means absent, so duplicates across chosen nodes fail too.
+    if ((Path != 1) || (*CommandLineSize != 0)) { return FALSE; }
+    *CommandLineSize = U32 (Data + CommandLineCandidate);
+    if (!DarwinCommandLineSizeValid (*CommandLineSize)) { return FALSE; }
+  }
   if (ExcludedCandidate != MAX_UINTN) {
     if ((Path != 1) || (*ExcludedOffset != MAX_UINTN)) { return FALSE; }
     *ExcludedOffset = ExcludedCandidate;
@@ -413,7 +425,7 @@ AdtNode (CONST UINT8 *Data, UINTN Size, UINTN *Offset, UINTN Depth, UINTN Parent
   }
   if (Children > (Size - *Offset) / 8) { return FALSE; }
   for (Index = 0; Index < Children; Index++) {
-    if (!AdtNode (Data, Size, Offset, Depth + 1, Path, RamdiskOffset, TrustCacheOffset, AddonOffset, PolicyOffset, WindowSize, KeepPacked, ExcludedOffset, ExcludedCapacity, InputsOffset)) { return FALSE; }
+    if (!AdtNode (Data, Size, Offset, Depth + 1, Path, RamdiskOffset, TrustCacheOffset, AddonOffset, PolicyOffset, WindowSize, KeepPacked, ExcludedOffset, ExcludedCapacity, InputsOffset, CommandLineSize)) { return FALSE; }
   }
   return TRUE;
 }
@@ -689,7 +701,7 @@ FindOutsideTable (CONST UINT8 *Tree, UINTN TreeSize, UINTN *TableOffset, UINTN *
   return FALSE;
 }
 
-// Fill the device tree's table from a memory map and report the usable bytes as the memory size. FALSE when the
+// Fill the table and retain the real usable count independently of the ABI-encoded actual. FALSE when the
 // head is no longer whole, which the head allocation rules out.
 STATIC
 BOOLEAN
@@ -703,6 +715,8 @@ DescribeWindow (
   UINT8             *Table,
   UINTN             Capacity,
   DARWIN_BOOT_ARGS  *Args,
+  UINT32            CommandLineSize,
+  UINT64            *Usable,
   UINTN             *Count
   )
 {
@@ -710,7 +724,8 @@ DescribeWindow (
 
   if (DarwinRunEnd (Map, MapSize, Stride, FALSE, Address, Address + HeadSize) != Address + HeadSize) { return FALSE; }
   *Count = DarwinWindowExclusions (Map, MapSize, Stride, Address, WindowSize, Table, Capacity, &Excluded);
-  Args->MemorySizeActual = WindowSize - Excluded;
+  *Usable = WindowSize - Excluded;
+  DarwinBootArgsSetMemory (Args, CommandLineSize, *Usable);
   return TRUE;
 }
 
@@ -816,6 +831,8 @@ Boot (
   UINT32                          Version;
   UINTN                           Attempt;
   CHAR8                           CommandLine[1024];
+  UINT32                          CommandLineSize;
+  UINT64                          Usable;
   UINT64                          Video[6];
   LAYOUT                          Layout;
   UINTN                           ExcludedOffset;
@@ -894,10 +911,17 @@ Boot (
   ExcludedOffset = MAX_UINTN;
   ExcludedCapacity = 0;
   InputsOffset = MAX_UINTN;
+  CommandLineSize = 0;
   OutsideOffset = MAX_UINTN;
   OutsideCapacity = 0;
   if (!FindOutsideTable (Tree, TreeSize, &OutsideOffset, &OutsideCapacity)) { OutsideOffset = MAX_UINTN; }
-  if (!AdtNode (Tree, TreeSize, &Offset, 0, 3, &RamdiskOffset, &TrustCacheOffset, &AddonOffset, &PolicyOffset, &WindowSize, &KeepPacked, &ExcludedOffset, &ExcludedCapacity, &InputsOffset) || (Offset != TreeSize)) { Status = EFI_COMPROMISED_DATA; goto Fail; }
+  if (!AdtNode (Tree, TreeSize, &Offset, 0, 3, &RamdiskOffset, &TrustCacheOffset, &AddonOffset, &PolicyOffset, &WindowSize, &KeepPacked, &ExcludedOffset, &ExcludedCapacity, &InputsOffset, &CommandLineSize) || (Offset != TreeSize)) { Status = EFI_COMPROMISED_DATA; goto Fail; }
+  if (CommandLineSize == 0) { CommandLineSize = 1024; }
+  if (!DarwinCommandLineFits (CommandLine, CommandLineSize)) {
+    Print (L"DARWINBOOT: boot args exceed selected %u-byte command line; firmware retained\n", CommandLineSize);
+    Status = EFI_BAD_BUFFER_SIZE;
+    goto Fail;
+  }
   if (KeepPacked && (!RamdiskPacked || (RamdiskOffset == MAX_UINTN))) { Status = EFI_COMPROMISED_DATA; goto Fail; }
   if (WindowSize == 0) { WindowSize = WINDOW_SIZE; }
   if (Kernel.Base > MAX_UINT64 - WindowSize) { Status = EFI_LOAD_ERROR; goto Fail; }
@@ -996,12 +1020,13 @@ Boot (
   Args->VirtualBase = Kernel.Base;
   Args->PhysicalBase = Address;
   Args->MemorySize = WindowSize;
-  Args->MemorySizeActual = WindowSize;
+  Usable = WindowSize;
+  DarwinBootArgsSetMemory (Args, CommandLineSize, Usable);
   Args->TopOfKernelData = Address + Used;
   CopyMem (Args->Video, Video, sizeof (Video));
   Args->DeviceTree = Kernel.Base + TreeAddress - Address;
   Args->DeviceTreeLength = (UINT32)TreeSize;
-  CopyMem (Args->CommandLine, CommandLine, sizeof (CommandLine));
+  CopyMem (Args->CommandLine, CommandLine, CommandLineSize);
   CopyMem ((VOID *)(UINTN)TreeAddress, Tree, TreeSize);
   if (Request->Ramdisk != NULL) {
     if (KeepPacked) { CopyMem ((VOID *)(UINTN)RamdiskAddress, Request->Ramdisk, Request->RamdiskSize); }
@@ -1063,12 +1088,12 @@ Boot (
   if (ExcludedOffset != MAX_UINTN) {
     // The table as this map gives it; the map ExitBootServices accepts decides the one XNU reads.
     Excluded = (UINT8 *)(UINTN)(TreeAddress + ExcludedOffset);
-    if (!DescribeWindow (Map, MapSize, Stride, Address, WindowSize, HeadSize, Excluded, ExcludedCapacity, Args, &ExcludedCount)) {
+    if (!DescribeWindow (Map, MapSize, Stride, Address, WindowSize, HeadSize, Excluded, ExcludedCapacity, Args, CommandLineSize, &Usable, &ExcludedCount)) {
       Status = EFI_LOAD_ERROR;
       goto Fail;
     }
-    Print (L"DARWINBOOT: window head=0x%lx usable=0x%lx excluded ranges=%lu of %lu\n",
-           HeadSize, Args->MemorySizeActual, (UINT64)ExcludedCount, (UINT64)ExcludedCapacity);
+    Print (L"DARWINBOOT: window head=0x%lx usable=0x%lx encoded actual=0x%lx excluded ranges=%lu of %lu\n",
+           HeadSize, Usable, DarwinBootArgsGetActual (Args, CommandLineSize), (UINT64)ExcludedCount, (UINT64)ExcludedCapacity);
     for (Index = 0; Index < ExcludedCount; Index++) {
       Print (L"DARWINBOOT: excluded 0x%lx + 0x%lx\n", DarwinRangeBase (Excluded, Index), DarwinRangeSize (Excluded, Index));
     }
@@ -1088,6 +1113,8 @@ Boot (
          ((DARWIN_BOOT_ARGS *)(UINTN)ArgsAddress)->DeviceTree,
          (UINT64)((DARWIN_BOOT_ARGS *)(UINTN)ArgsAddress)->DeviceTreeLength,
          ((DARWIN_BOOT_ARGS *)(UINTN)ArgsAddress)->Video[0]);
+  Print (L"DARWINBOOT: command line size=%u usable=0x%lx encoded actual=0x%lx flags=0x%lx\n",
+         CommandLineSize, Usable, DarwinBootArgsGetActual (Args, CommandLineSize), DarwinBootArgsGetFlags (Args, CommandLineSize));
   Print (L"DARWINBOOT: inputs validated; exiting boot services\n");
 
   //
@@ -1100,7 +1127,7 @@ Boot (
   DEBUG ((DEBUG_ERROR, "entry    pa 0x%lx\n", Address + Kernel.Entry - Kernel.Base));
   DEBUG ((DEBUG_ERROR, "args     pa 0x%lx  window 0x%lx bytes\n", ArgsAddress, (UINT64)WindowSize));
   if (Excluded != NULL) {
-    DEBUG ((DEBUG_ERROR, "memory   usable 0x%lx  excluded ranges %lu\n", Args->MemorySizeActual, (UINT64)ExcludedCount));
+    DEBUG ((DEBUG_ERROR, "memory   usable 0x%lx  encoded actual 0x%lx  excluded ranges %lu\n", Usable, DarwinBootArgsGetActual (Args, CommandLineSize), (UINT64)ExcludedCount));
   }
   if (InputsOffset != MAX_UINTN) {
     DEBUG ((DEBUG_ERROR, "disk     0x%lx + 0x%lx  type %d  state %x\n", Inputs[DARWIN_INPUT_PAYLOAD_DISK].Base,
@@ -1137,7 +1164,7 @@ Boot (
       DarwinWriteInputs ((UINT8 *)(UINTN)(TreeAddress + InputsOffset), Inputs);
     }
     if ((Excluded != NULL) &&
-        !DescribeWindow (Map, MapSize, Stride, Address, WindowSize, HeadSize, Excluded, ExcludedCapacity, Args, &ExcludedCount)) {
+        !DescribeWindow (Map, MapSize, Stride, Address, WindowSize, HeadSize, Excluded, ExcludedCapacity, Args, CommandLineSize, &Usable, &ExcludedCount)) {
       if (Attempt == 0) { Status = EFI_LOAD_ERROR; goto Fail; }
       CpuDeadLoop ();
     }

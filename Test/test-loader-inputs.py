@@ -126,10 +126,11 @@ typedef size_t UINTN; typedef int BOOLEAN; typedef char CHAR8;
 enum { EfiReservedMemoryType, EfiLoaderCode, EfiLoaderData, EfiBootServicesCode, EfiBootServicesData,
        EfiRuntimeServicesCode, EfiRuntimeServicesData, EfiConventionalMemory };
 typedef struct { UINT32 Type; UINT64 PhysicalStart; UINT64 VirtualStart; UINT64 NumberOfPages; UINT64 Attribute; } EFI_MEMORY_DESCRIPTOR;
-static UINT16 ReadUnaligned16(const UINT16 *p) { UINT16 v; memcpy(&v, p, 2); return v; }
-static UINT64 ReadUnaligned64(const UINT64 *p) { UINT64 v; memcpy(&v, p, 8); return v; }
-static void WriteUnaligned32(UINT32 *p, UINT32 v) { memcpy(p, &v, 4); }
-static void WriteUnaligned64(UINT64 *p, UINT64 v) { memcpy(p, &v, 8); }
+// Explicit bytes preserve the unaligned API contract under Clang's memcpy instrumentation.
+static UINT16 ReadUnaligned16(const UINT16 *p) { UINT16 v; memcpy(&v, (const unsigned char *)p, 2); return v; }
+static UINT64 ReadUnaligned64(const UINT64 *p) { UINT64 v; memcpy(&v, (const unsigned char *)p, 8); return v; }
+static void WriteUnaligned32(UINT32 *p, UINT32 v) { memcpy((unsigned char *)p, &v, 4); }
+static void WriteUnaligned64(UINT64 *p, UINT64 v) { memcpy((unsigned char *)p, &v, 8); }
 #include "LoaderInputs.h"
 int hob_value(const UINT8 *hob, size_t limit, const UINT8 *guid, UINT64 *value) { return DarwinHobValue(hob, limit, guid, value); }
 size_t hob_size(const UINT8 *hob, UINT64 address, UINT64 limit) { return DarwinHobListSize(hob, address, limit); }
